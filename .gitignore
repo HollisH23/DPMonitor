@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Django local artefacts
+backend/data/
+backend/logs/
+*.sqlite3
+*.sqlite3-journal
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.env.local
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
