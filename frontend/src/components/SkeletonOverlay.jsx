@@ -37,7 +37,7 @@ export default function SkeletonOverlay({ points, qualityScore, isCompensatory }
     for (const [a, b] of POSE_EDGES) {
       const pa = points[a]; const pb = points[b];
       if (!pa || !pb) continue;
-      if (pa[3] < 0.3 || pb[3] < 0.3) continue;
+      if (pa[3] < 0.5 || pb[3] < 0.5) continue;
       ctx.beginPath();
       ctx.moveTo(pa[0] * w, pa[1] * h);
       ctx.lineTo(pb[0] * w, pb[1] * h);
@@ -47,7 +47,7 @@ export default function SkeletonOverlay({ points, qualityScore, isCompensatory }
     ctx.shadowBlur = 12;
     for (const k of Object.keys(points)) {
       const p = points[k];
-      if (p[3] < 0.3) continue;
+      if (p[3] < 0.5) continue;
       ctx.beginPath();
       ctx.arc(p[0] * w, p[1] * h, 4, 0, Math.PI * 2);
       ctx.fill();

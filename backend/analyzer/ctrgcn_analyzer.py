@@ -48,7 +48,7 @@ from .kinematics import (
     tremor_metrics,
 )
 from .mediapipe_graph import LANDMARK_NAMES, NUM_NODE
-from .normalization import normalize_pose
+from .normalization import apply_occlusion_carryforward, normalize_pose
 from .seed import apply_global_seed
 from .similarity import similarity_score
 from .synthesis import synthesize
@@ -143,6 +143,10 @@ class CTRGCNAnalyzer(BaseAnalyzer):
         # ``generate_summary()`` time.
         self._session_log: List[Dict[str, Any]] = []
 
+        # Occlusion carry-forward: store the previous frame's normalised
+        # array so occluded joints can be replaced with stable values.
+        self._prev_normed: Optional[np.ndarray] = None
+
     def _build_model(self) -> None:
         # Imported here so the (heavy) ctrgcn import doesn't pay its cost
         # at module-load time.
@@ -192,9 +196,10 @@ class CTRGCNAnalyzer(BaseAnalyzer):
             np.asarray(feature, dtype=np.float32) if feature is not None else None
         )
 
-    def _stack_frame(self, frame: AnalyzerFrame) -> np.ndarray:
-        """Flatten one frame's points dict to a (33, 3) np.float32 array."""
+    def _stack_frame(self, frame: AnalyzerFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """Flatten one frame's points dict to a (33, 3) array + (33,) visibility."""
         out = np.zeros((NUM_NODE, 3), dtype=np.float32)
+        vis = np.zeros(NUM_NODE, dtype=np.float32)
         for i, name in enumerate(LANDMARK_NAMES):
             p = frame.points.get(name)
             if not p:
@@ -203,7 +208,8 @@ class CTRGCNAnalyzer(BaseAnalyzer):
             out[i, 0] = float(p[0]) if len(p) > 0 else 0.0
             out[i, 1] = float(p[1]) if len(p) > 1 else 0.0
             out[i, 2] = float(p[2]) if len(p) > 2 else 0.0
-        return out
+            vis[i] = float(p[3]) if len(p) > 3 else 0.0
+        return out, vis
 
     def _make_tensor(self, frames_TVC: np.ndarray):
         """``(T, V, 3)`` numpy → ``(1, 3, T, V, 1)`` torch tensor."""
@@ -226,10 +232,15 @@ class CTRGCNAnalyzer(BaseAnalyzer):
             smoothed = float(np.mean(self._hip_window))
             self._update_rep_counter(smoothed, feedback)
 
-        # 2) Stack + normalise + buffer.
-        raw = self._stack_frame(frame)
+        # 2) Stack + normalise + occlusion carry-forward + buffer.
+        raw, visibility = self._stack_frame(frame)
         self._raw_buffer.append(raw)
         normed = normalize_pose(raw) if self._normalize else raw
+        # Replace occluded joints with previous frame's normalised values.
+        normed = apply_occlusion_carryforward(
+            normed, visibility, self._prev_normed,
+        )
+        self._prev_normed = normed
         self._buffer.append(normed)
         self._frames_since_inference += 1
 

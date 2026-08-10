@@ -1,0 +1,107 @@
+# XcodeGen spec for the DPMonitor iOS app.
+#
+#   brew install xcodegen
+#   cd ios && xcodegen generate
+#   pod install                     # MediaPipe Tasks Vision (see README)
+#   open DPMonitor.xcworkspace
+#
+# Regenerate the project any time files are added/removed — nothing is
+# tracked in a hand-maintained .pbxproj.
+
+name: DPMonitor
+
+options:
+  bundleIdPrefix: au.edu.usyd.dpmonitor
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    SWIFT_STRICT_CONCURRENCY: minimal
+    # The app is offline-only; no ATS exceptions are needed because no
+    # network request is ever made. See README "Offline guarantee".
+  configs:
+    Debug:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+      GCC_OPTIMIZATION_LEVEL: "0"
+      SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+    Release:
+      SWIFT_OPTIMIZATION_LEVEL: "-O"
+      SWIFT_COMPILATION_MODE: wholemodule
+      VALIDATE_PRODUCT: YES
+
+targets:
+  DPMonitor:
+    type: application
+    platform: iOS
+    sources:
+      - path: DPMonitor
+        excludes:
+          - "**/.DS_Store"
+          - "**/*.task"
+      - path: DPMonitor/Models/pose_landmarker_full.task
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: au.edu.usyd.dpmonitor
+        # INFOPLIST_FILE is set automatically by XcodeGen from `info.path`.
+        TARGETED_DEVICE_FAMILY: "1"          # iPhone only
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Core ML compiles .mlpackage -> .mlmodelc at build time and
+        # generates the `CTRGCN` Swift class consumed by ActionClassifier.
+        COREML_CODEGEN_LANGUAGE: Swift
+        DEVELOPMENT_TEAM: 23V4Y53YW5
+    info:
+      path: DPMonitor/Info.plist
+      properties:
+        CFBundleDisplayName: DPMonitor
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # Required: the app opens the camera on the live-session screen.
+        NSCameraUsageDescription: >-
+          DPMonitor uses the camera to track your body movement during a
+          rehabilitation session. All video is processed on this device and
+          is never recorded, saved, or transmitted.
+        # Deliberately NOT requested: photo library, microphone, location.
+        ITSAppUsesNonExemptEncryption: false
+
+  DPMonitorTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: DPMonitorTests
+        excludes:
+          - "**/.DS_Store"
+    dependencies:
+      - target: DPMonitor
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: au.edu.usyd.dpmonitor.tests
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  DPMonitor:
+    build:
+      targets:
+        DPMonitor: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      gatherCoverageData: true
+      targets:
+        - DPMonitorTests
+    profile:
+      config: Release
+    archive:
+      config: Release

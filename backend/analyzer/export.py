@@ -2,11 +2,20 @@
 
 Plan task 8: the live edge deployment needs a deploy artefact that
 isn't a Python pickle of the training graph. We try ONNX first because
-it's the most portable, but CTR-GCN's adaptive topology refinement
-involves ``einsum`` calls (see ``ctrgcn.ctrgcn.CTRGC.forward``) which
-some ONNX opset versions can't represent. When that conversion raises,
-we pivot to TorchScript tracing, which natively handles every op
-PyTorch can run.
+it's the most portable, and fall back to TorchScript tracing, which
+natively handles every op PyTorch can run.
+
+Historically the ONNX path failed: CTR-GCN's adaptive topology
+refinement used ``torch.einsum('ncuv,nctv->nctu', ...)`` (see
+``ctrgcn.ctrgcn.CTRGC.forward``), which some ONNX opset versions cannot
+represent. That call has since been rewritten as ``matmul`` +
+``permute`` — numerically identical, and pinned by
+``CTRGCNExportCompatibilityTests`` — so ONNX export should now succeed.
+The TorchScript fallback is retained for any op we haven't anticipated.
+
+For the iOS Core ML artefact use ``scripts/export_coreml.py`` instead:
+``coremltools`` dropped its ONNX front-end in 6.0, so the ``.mlpackage``
+is built from a TorchScript trace rather than from the ONNX emitted here.
 
 The function returns the absolute path of the artefact that was
 actually written, plus the format that succeeded. Callers — typically a

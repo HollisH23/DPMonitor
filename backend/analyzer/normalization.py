@@ -22,6 +22,13 @@ Both steps are applied in numpy so the function is cheap enough to run
 inline on every 30 FPS frame. Degenerate cases (missing hips, zero spine
 length) fall back to returning the input unchanged rather than blowing
 up the live stream — the rest of the pipeline can still operate.
+
+Phase 3 — Occlusion carry-forward:
+When a joint's visibility drops below a threshold (default 0.5), its
+normalised coordinates are replaced with the previous frame's value
+via :func:`apply_occlusion_carryforward`. This prevents low-confidence
+joint detections from injecting erratic spatial noise into the GCN
+sliding window.
 """
 from __future__ import annotations
 
@@ -39,6 +46,9 @@ _RIGHT_SHOULDER_IDX = LANDMARK_NAMES.index("right_shoulder")
 # Below this spine length the rescale would explode small numerical noise
 # into very large coordinates; fall back to "no scale" instead.
 _MIN_SPINE_LENGTH = 1e-3
+
+# Default visibility threshold for occlusion carry-forward.
+_OCCLUSION_THRESHOLD = 0.5
 
 
 def normalize_pose(frame_VC: np.ndarray) -> np.ndarray:
@@ -80,6 +90,55 @@ def normalize_window(frames_TVC: np.ndarray) -> np.ndarray:
     return out
 
 
+def apply_occlusion_carryforward(
+    normed_VC: np.ndarray,
+    visibility: Optional[np.ndarray],
+    prev_normed_VC: Optional[np.ndarray],
+    threshold: float = _OCCLUSION_THRESHOLD,
+) -> np.ndarray:
+    """Replace occluded joints' normalized coords with previous frame values.
+
+    When a joint's visibility score is below ``threshold``, its normalised
+    coordinates are unreliable — the detection is a low-confidence guess
+    that would inject spatial noise into the CTR-GCN sliding window. We
+    carry forward the previous frame's normalised value instead.
+
+    Parameters
+    ----------
+    normed_VC : np.ndarray
+        The ``(V, C)`` normalised pose for the current frame.
+    visibility : np.ndarray or None
+        A ``(V,)`` array of per-joint visibility scores in ``[0, 1]``.
+        If ``None``, no carry-forward is applied (all joints kept as-is).
+    prev_normed_VC : np.ndarray or None
+        The normalised pose from the previous frame. If ``None`` (first
+        frame of a session), no carry-forward is possible.
+    threshold : float
+        Visibility score below which a joint is considered occluded.
+
+    Returns
+    -------
+    np.ndarray
+        The ``(V, C)`` array with occluded joints replaced.
+    """
+    if visibility is None or prev_normed_VC is None:
+        return normed_VC
+
+    if visibility.shape[0] != normed_VC.shape[0]:
+        return normed_VC
+
+    # Build a mask: True where the joint is occluded.
+    occluded = visibility < threshold
+    if not occluded.any():
+        return normed_VC
+
+    result = normed_VC.copy()
+    for v in range(normed_VC.shape[0]):
+        if occluded[v]:
+            result[v] = prev_normed_VC[v]
+    return result
+
+
 def _midpoint(
     arr_VC: np.ndarray, idx_a: int, idx_b: int,
 ) -> Tuple[np.ndarray, bool]:
@@ -103,4 +162,4 @@ def _midpoint(
     return np.zeros_like(a), False
 
 
-__all__ = ["normalize_pose", "normalize_window"]
+__all__ = ["normalize_pose", "normalize_window", "apply_occlusion_carryforward"]

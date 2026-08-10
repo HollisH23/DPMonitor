@@ -1,9 +1,13 @@
-// usePoseDetection — webcam + MediaPipe Pose, normalised output at 30 FPS.
+// usePoseDetection — webcam + MediaPipe Pose, two-branch output at 30 FPS.
 //
 // Returns: { videoRef, latest, isRunning, startCamera, stopCamera, error }
-// where `latest` is { frameIndex, timestampMs, points, angles } updated on
-// every MediaPipe callback. Callers can sample at whatever cadence they need
-// (we downsample to 15 FPS for persistence in LiveMonitor).
+// where `latest` contains:
+//   - points:          Raw MediaPipe coordinates (Branch A — UI overlay).
+//   - angles:          Joint angles from raw points (Branch A — gauges).
+//   - smoothedPoints:  EMA-filtered coordinates (Branch B — GCN model).
+//
+// Branch A uses raw coords for pixel-accurate body tracking with zero lag.
+// Branch B uses EMA-smoothed coords to reduce jitter for the CTR-GCN model.
 //
 // Camera handling note (Phase 2.2 — FOV refinement):
 // We deliberately bypass `@mediapipe/camera_utils` `Camera` helper because its
@@ -12,12 +16,19 @@
 // `aspectRatio` constraint). To enforce a widescreen 1080p user-facing capture
 // we call `navigator.mediaDevices.getUserMedia` directly and drive MediaPipe
 // from our own `requestAnimationFrame` loop.
+//
+// Phase 2.3 — Video file support:
+// When `videoFile` is provided, we create a Blob URL and pipe its frames through
+// the same MediaPipe Pose pipeline. Timestamps map to `videoEl.currentTime`.
+// A `seeked` listener fires a single pose send so the skeleton overlay updates
+// instantly when scrubbing while paused.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { computeAngles, landmarksToPoints } from '../lib/poseUtils.js';
+import { createPoseSmoother } from '../lib/poseSmoothing.js';
 
-export function usePoseDetection({ enabled }) {
+export function usePoseDetection({ enabled, videoFile = null }) {
   const videoRef = useRef(null);
   const poseRef = useRef(null);
   const streamRef = useRef(null);
@@ -25,6 +36,11 @@ export function usePoseDetection({ enabled }) {
   const sendingRef = useRef(false);
   const frameIndexRef = useRef(0);
   const startTimeRef = useRef(null);
+  const blobUrlRef = useRef(null);
+  // Track the current mode so cleanup knows which teardown path to take.
+  const modeRef = useRef(null); // 'webcam' | 'file'
+  // EMA smoother for Branch B (GCN model data). Raw points go to Branch A.
+  const smootherRef = useRef(createPoseSmoother());
 
   const [latest, setLatest] = useState(null);
   const [isRunning, setIsRunning] = useState(false);
@@ -38,7 +54,7 @@ export function usePoseDetection({ enabled }) {
     }
     sendingRef.current = false;
 
-    // Stop every media track returned by getUserMedia.
+    // Stop every media track returned by getUserMedia (webcam mode only).
     if (streamRef.current) {
       try { streamRef.current.getTracks().forEach((t) => t.stop()); } catch { /* no-op */ }
       streamRef.current = null;
@@ -48,13 +64,30 @@ export function usePoseDetection({ enabled }) {
       try { videoRef.current.srcObject.getTracks().forEach((t) => t.stop()); } catch { /* no-op */ }
       videoRef.current.srcObject = null;
     }
+
+    // Revoke Blob URL if we created one (file mode).
+    if (blobUrlRef.current) {
+      try { URL.revokeObjectURL(blobUrlRef.current); } catch { /* no-op */ }
+      blobUrlRef.current = null;
+    }
+    // Clear file-mode src so the element doesn't hold a stale reference.
+    if (videoRef.current && modeRef.current === 'file') {
+      videoRef.current.removeAttribute('src');
+      videoRef.current.load(); // reset the element
+    }
+
+    // Reset the EMA smoother so the next session starts fresh.
+    smootherRef.current.reset();
+
+    modeRef.current = null;
     setIsRunning(false);
   }, []);
 
   const startCamera = useCallback(async () => {
     setError(null);
     if (!videoRef.current) return;
-    if (streamRef.current) return; // already running
+    // Prevent double-starts — if already running, bail.
+    if (streamRef.current || blobUrlRef.current) return;
 
     // Lazily import MediaPipe Pose so the dashboard doesn't pay the cost.
     let Pose;
@@ -71,31 +104,132 @@ export function usePoseDetection({ enabled }) {
       locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
     });
     pose.setOptions({
-      modelComplexity: 1,
+      modelComplexity: 2,
       smoothLandmarks: true,
       enableSegmentation: false,
-      minDetectionConfidence: 0.5,
-      minTrackingConfidence: 0.5,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence: 0.7,
     });
     pose.onResults((results) => {
       if (!results.poseLandmarks) {
         return;
       }
+      // Branch A: raw coordinates for pixel-accurate UI overlay.
       const points = landmarksToPoints(results.poseLandmarks);
       const angles = computeAngles(points);
-      const now = performance.now();
-      if (startTimeRef.current == null) startTimeRef.current = now;
-      const tMs = now - startTimeRef.current;
+
+      // Branch B: EMA-smoothed coordinates for the GCN model.
+      const smoothedPoints = smootherRef.current.smooth(points);
+
+      let tMs;
+      if (modeRef.current === 'file' && videoRef.current) {
+        // For uploaded videos, map directly to the video's playback position.
+        tMs = videoRef.current.currentTime * 1000;
+      } else {
+        const now = performance.now();
+        if (startTimeRef.current == null) startTimeRef.current = now;
+        tMs = now - startTimeRef.current;
+      }
+
       const idx = frameIndexRef.current++;
       setLatest({
         frameIndex: idx,
         timestampMs: tMs,
-        points,
-        angles,
+        points,                // Branch A: raw for SkeletonOverlay / JointGauges
+        angles,                // Branch A: raw angles for gauges
+        smoothedPoints,        // Branch B: EMA-smoothed for WebSocket / GCN
         rawLandmarks: results.poseLandmarks,
       });
     });
     poseRef.current = pose;
+
+    const videoEl = videoRef.current;
+
+    // ------------------------------------------------------------------
+    // FILE MODE — use Blob URL instead of getUserMedia
+    // ------------------------------------------------------------------
+    if (videoFile) {
+      modeRef.current = 'file';
+      const url = URL.createObjectURL(videoFile);
+      blobUrlRef.current = url;
+
+      videoEl.src = url;
+      videoEl.muted = true;
+      videoEl.playsInline = true;
+      // Don't autoplay — let LiveMonitor control play/pause via session state.
+
+      try {
+        await new Promise((resolve, reject) => {
+          const onLoaded = () => {
+            videoEl.removeEventListener('loadedmetadata', onLoaded);
+            videoEl.removeEventListener('error', onError);
+            resolve();
+          };
+          const onError = (ev) => {
+            videoEl.removeEventListener('loadedmetadata', onLoaded);
+            videoEl.removeEventListener('error', onError);
+            reject(ev?.error || new Error('Video element failed to load file.'));
+          };
+          videoEl.addEventListener('loadedmetadata', onLoaded);
+          videoEl.addEventListener('error', onError);
+        });
+      } catch (e) {
+        setError(e);
+        setIsRunning(false);
+        URL.revokeObjectURL(url);
+        blobUrlRef.current = null;
+        if (videoRef.current) videoRef.current.removeAttribute('src');
+        return;
+      }
+
+      // Seeked handler — when user scrubs while paused, fire a single pose
+      // send so the skeleton overlay updates immediately.
+      const onSeeked = async () => {
+        if (!poseRef.current || !videoRef.current) return;
+        if (videoRef.current.readyState >= 2 && !sendingRef.current) {
+          sendingRef.current = true;
+          try {
+            await poseRef.current.send({ image: videoRef.current });
+          } catch { /* swallow */ } finally {
+            sendingRef.current = false;
+          }
+        }
+      };
+      videoEl.addEventListener('seeked', onSeeked);
+
+      // Frame pump for file mode — only pushes frames while video is playing.
+      const pump = async () => {
+        if (!blobUrlRef.current || !poseRef.current || !videoRef.current) {
+          rafRef.current = null;
+          return;
+        }
+        if (
+          !sendingRef.current &&
+          !videoRef.current.paused &&
+          videoRef.current.readyState >= 2
+        ) {
+          sendingRef.current = true;
+          try {
+            await poseRef.current.send({ image: videoRef.current });
+          } catch { /* swallow */ } finally {
+            sendingRef.current = false;
+          }
+        }
+        if (blobUrlRef.current) {
+          rafRef.current = requestAnimationFrame(pump);
+        } else {
+          rafRef.current = null;
+        }
+      };
+      rafRef.current = requestAnimationFrame(pump);
+      setIsRunning(true);
+      return;
+    }
+
+    // ------------------------------------------------------------------
+    // WEBCAM MODE — existing getUserMedia flow
+    // ------------------------------------------------------------------
+    modeRef.current = 'webcam';
 
     // Phase 2.2 — request a widescreen 1080p user-facing stream. We pass full
     // MediaTrackConstraints (with `ideal` fields and `aspectRatio`) directly to
@@ -121,7 +255,6 @@ export function usePoseDetection({ enabled }) {
       return;
     }
 
-    const videoEl = videoRef.current;
     if (!videoEl) {
       // Component unmounted while we awaited getUserMedia — release the stream.
       try { stream.getTracks().forEach((t) => t.stop()); } catch { /* no-op */ }
@@ -192,14 +325,14 @@ export function usePoseDetection({ enabled }) {
     };
     rafRef.current = requestAnimationFrame(pump);
     setIsRunning(true);
-  }, []);
+  }, [videoFile]);
 
   // Auto-start when enabled, auto-stop when disabled / unmounted.
   useEffect(() => {
     if (enabled) startCamera();
     return () => { stopCamera(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled]);
+  }, [enabled, videoFile]);
 
   return { videoRef, latest, isRunning, error, startCamera, stopCamera };
 }

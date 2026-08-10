@@ -940,3 +940,246 @@ class CTRGCNSessionLogTests(TestCase):
             self.assertIn(key, sb)
         self.assertIn("rom_curve", sb["charts"])
         self.assertIn("stability_trend", sb["charts"])
+
+
+@unittest.skipUnless(_HAS_TORCH, "torch not installed; skipping CTR-GCN export tests")
+class CTRGCNExportCompatibilityTests(TestCase):
+    """Guard the ONNX/Core ML export path.
+
+    ``CTRGC.forward`` originally contracted its adaptive topology with
+    ``torch.einsum('ncuv,nctv->nctu', x1, x3)``. Several ONNX opsets cannot
+    represent that op, and the Core ML converter inherits the limitation, so
+    it was rewritten as ``matmul`` + ``permute``.
+
+    These tests exist because the rewrite is the kind of change that is
+    silently wrong: a transposed contraction still produces a correctly
+    shaped tensor and a plausible-looking logit, and nothing downstream
+    would complain. Pinning the equivalence numerically is the only way to
+    notice.
+    """
+
+    def test_matmul_form_equals_einsum_form(self) -> None:
+        import torch
+
+        torch.manual_seed(1337)
+        N, C, T, U, V = 2, 4, 6, 5, 5   # U == V for the square adjacency
+        x1 = torch.randn(N, C, U, V)
+        x3 = torch.randn(N, C, T, V)
+
+        reference = torch.einsum("ncuv,nctv->nctu", x1, x3)
+        rewritten = torch.matmul(x1, x3.permute(0, 1, 3, 2)).permute(0, 1, 3, 2)
+
+        self.assertEqual(tuple(rewritten.shape), tuple(reference.shape))
+        self.assertLess(
+            float((reference - rewritten).abs().max()),
+            1e-5,
+            "matmul rewrite must be numerically identical to the einsum it replaced",
+        )
+
+    def test_ctrgc_forward_contains_no_einsum(self) -> None:
+        """A regression tripwire for anyone re-introducing ``einsum``.
+
+        Inspects the AST rather than the raw source: the method carries a
+        comment explaining which einsum the matmul replaced, and a plain
+        substring search would trip over its own documentation.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from ctrgcn.ctrgcn import CTRGC
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(CTRGC.forward)))
+        called = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                called.add(func.attr)
+            elif isinstance(func, ast.Name):
+                called.add(func.id)
+
+        self.assertNotIn(
+            "einsum",
+            called,
+            "einsum in CTRGC.forward breaks ONNX/Core ML export — "
+            "see scripts/export_coreml.py",
+        )
+        self.assertIn("matmul", called, "the matmul rewrite has gone missing")
+
+    def test_model_traces_for_export(self) -> None:
+        """The exact trace ``scripts/export_coreml.py`` performs.
+
+        Tracing is where an unsupported op actually surfaces, so this is the
+        cheapest possible early warning that the export has broken.
+        """
+        import torch
+
+        from analyzer.mediapipe_graph import NUM_NODE
+        from analyzer.seed import apply_global_seed
+        from ctrgcn.ctrgcn import Model
+
+        apply_global_seed(1337)
+        model = Model(
+            num_class=2,
+            num_point=NUM_NODE,
+            num_person=1,
+            graph="analyzer.mediapipe_graph.Graph",
+            graph_args={"labeling_mode": "spatial"},
+            in_channels=3,
+            drop_out=0.0,
+            adaptive=True,
+        )
+        model.eval()
+
+        # A short window keeps the trace fast; the op set is identical at 64.
+        dummy = torch.zeros(1, 3, 16, NUM_NODE, 1, dtype=torch.float32)
+        with torch.no_grad():
+            traced = torch.jit.trace(model, dummy, strict=False)
+            traced_out = traced(dummy)
+            eager_out = model(dummy)
+
+        self.assertEqual(tuple(traced_out.shape), (1, 2))
+        self.assertLess(float((traced_out - eager_out).abs().max()), 1e-5)
+
+
+class CenteringTests(TestCase):
+    """Framing assistant. Port of Final/centering_logic.py.
+
+    Framing failures are the quietest kind of bad data: a patient half out
+    of frame still produces landmarks, still fills the sliding window, and
+    still yields a quality score. These tests exist because nothing
+    downstream can tell the difference.
+
+    No torch needed — this module is pure arithmetic.
+    """
+
+    @staticmethod
+    def _pose(hip_x=0.5, shoulder_x=None, nose_y=0.10, hip_y=0.60,
+              knee_y=0.80, nose_vis=0.9, drop=()):
+        sx = hip_x if shoulder_x is None else shoulder_x
+        w = 0.09
+        pose = {
+            "nose": [hip_x, nose_y, 0.0, nose_vis],
+            "left_shoulder": [sx - w, 0.32, 0.0, 0.9],
+            "right_shoulder": [sx + w, 0.32, 0.0, 0.9],
+            "left_hip": [hip_x - w, hip_y, 0.0, 0.9],
+            "right_hip": [hip_x + w, hip_y, 0.0, 0.9],
+            "left_knee": [hip_x - w, knee_y, 0.0, 0.9],
+            "right_knee": [hip_x + w, knee_y, 0.0, 0.9],
+        }
+        for name in drop:
+            pose.pop(name, None)
+        return pose
+
+    def test_centered_pose_passes_every_check(self) -> None:
+        from analyzer.centering import evaluate_centering
+
+        r = evaluate_centering(self._pose())
+        self.assertTrue(r.is_centered)
+        self.assertEqual(r.status, "Patient is CENTERED")
+        self.assertEqual(r.status_code, "centered")
+        self.assertEqual(r.severity, "ok")
+
+    def test_horizontal_bounds_are_inclusive(self) -> None:
+        """0.30 and 0.70 must not themselves trigger a warning."""
+        from analyzer.centering import evaluate_centering
+
+        for x in (0.30, 0.70):
+            self.assertTrue(evaluate_centering(self._pose(hip_x=x)).is_centered,
+                            f"hip x={x} sits on the boundary and is allowed")
+        self.assertEqual(
+            evaluate_centering(self._pose(hip_x=0.2999)).status,
+            "Patient too far LEFT")
+        self.assertEqual(
+            evaluate_centering(self._pose(hip_x=0.7001)).status,
+            "Patient too far RIGHT")
+
+    def test_correction_direction_opposes_displacement(self) -> None:
+        from analyzer.centering import evaluate_centering
+
+        self.assertEqual(evaluate_centering(self._pose(hip_x=0.1)).status_code,
+                         "move_right")
+        self.assertEqual(evaluate_centering(self._pose(hip_x=0.9)).status_code,
+                         "move_left")
+
+    def test_torso_ratio_is_nose_to_hip(self) -> None:
+        """Regression guard for the easiest way to get this wrong.
+
+        Measuring shoulder-to-hip instead of nose-to-hip roughly halves
+        the ratio, which would push well-framed patients under the 0.12
+        'too far' threshold while raising no error anywhere.
+        """
+        from analyzer.centering import evaluate_centering
+
+        r = evaluate_centering(self._pose(nose_y=0.10, hip_y=0.60))
+        self.assertAlmostEqual(r.torso_height_ratio, 0.50, places=4)
+
+    def test_distance_thresholds(self) -> None:
+        from analyzer.centering import evaluate_centering
+
+        far = evaluate_centering(self._pose(nose_y=0.50, hip_y=0.58))
+        self.assertEqual(far.status, "Patient is TOO FAR from camera")
+        close = evaluate_centering(self._pose(nose_y=0.05, hip_y=0.80))
+        self.assertEqual(close.status, "Patient is TOO CLOSE to camera")
+        # Both boundaries are inclusive.
+        self.assertTrue(
+            evaluate_centering(self._pose(nose_y=0.48, hip_y=0.60)).is_centered)
+        self.assertTrue(
+            evaluate_centering(self._pose(nose_y=0.05, hip_y=0.75,
+                                          knee_y=0.90)).is_centered)
+
+    def test_head_visibility_gate_is_point_three(self) -> None:
+        """Not 0.5 — the head check is coarser than occlusion carry-forward."""
+        from analyzer.centering import evaluate_centering
+        from analyzer.normalization import _OCCLUSION_THRESHOLD
+
+        self.assertNotEqual(0.3, _OCCLUSION_THRESHOLD)
+        self.assertTrue(evaluate_centering(self._pose(nose_vis=0.3)).is_centered)
+        self.assertEqual(
+            evaluate_centering(self._pose(nose_vis=0.29)).status,
+            "Patient HEAD may be cut off")
+
+    def test_clipping_checks(self) -> None:
+        from analyzer.centering import evaluate_centering
+
+        self.assertEqual(evaluate_centering(self._pose(nose_y=0.01)).status,
+                         "Patient HEAD may be cut off")
+        self.assertTrue(evaluate_centering(self._pose(nose_y=0.03)).is_centered)
+        self.assertEqual(evaluate_centering(self._pose(knee_y=0.99)).status,
+                         "Patient FEET may be cut off")
+        self.assertTrue(evaluate_centering(self._pose(knee_y=0.97)).is_centered)
+
+    def test_hip_issue_wins_the_headline_but_all_are_listed(self) -> None:
+        from analyzer.centering import evaluate_centering
+
+        r = evaluate_centering(
+            self._pose(hip_x=0.05, nose_y=0.50, hip_y=0.58, knee_y=0.99))
+        self.assertEqual(r.status, "Patient too far LEFT")
+        self.assertIn("Patient FEET may be cut off", r.details)
+        self.assertIn("Patient is TOO FAR from camera", r.details)
+        self.assertTrue(r.details[-1].startswith("Hip center:"))
+
+    def test_missing_landmarks_report_not_detected(self) -> None:
+        from analyzer.centering import evaluate_centering
+
+        self.assertEqual(evaluate_centering({}).status_code, "not_detected")
+        for name in ("nose", "left_hip", "right_knee", "left_shoulder"):
+            r = evaluate_centering(self._pose(drop=(name,)))
+            self.assertEqual(r.status_code, "not_detected", f"missing {name}")
+            self.assertEqual(r.status, "Patient has left the field of view")
+            self.assertEqual(r.details, ["Pose not recognised."])
+            self.assertIsNone(r.hip_center_x)
+
+    def test_not_centered_never_reports_ok_severity(self) -> None:
+        """The banner colour must never contradict the banner text."""
+        from analyzer.centering import evaluate_centering
+
+        for pose in (self._pose(hip_x=0.1), self._pose(knee_y=0.99),
+                     self._pose(nose_y=0.0), self._pose(nose_y=0.5, hip_y=0.55),
+                     self._pose(shoulder_x=0.05), {}):
+            r = evaluate_centering(pose)
+            self.assertFalse(r.is_centered)
+            self.assertNotEqual(r.severity, "ok")
+            self.assertNotEqual(r.status_code, "centered")

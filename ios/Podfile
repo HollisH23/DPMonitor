@@ -1,0 +1,35 @@
+# MediaPipe Tasks Vision is distributed for iOS through CocoaPods; Google
+# does not publish an official Swift Package for it. XcodeGen generates
+# DPMonitor.xcodeproj, then CocoaPods wraps it in DPMonitor.xcworkspace.
+#
+#   cd ios
+#   xcodegen generate
+#   pod install
+#   open DPMonitor.xcworkspace     # <- always the workspace, not the project
+#
+# If you would rather avoid CocoaPods, see ios/README.md -> "Swift Package
+# alternative" for the community SPM mirror and the exact `packages:` block
+# to paste into project.yml.
+
+platform :ios, '18.0'
+use_frameworks!
+
+target 'DPMonitor' do
+  # 33-landmark BlazePose (Full) with world-space landmarks in metres.
+  pod 'MediaPipeTasksVision', '~> 0.10.14'
+
+  target 'DPMonitorTests' do
+    inherit! :search_paths
+  end
+end
+
+post_install do |installer|
+  installer.pods_project.targets.each do |t|
+    t.build_configurations.each do |config|
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '18.0'
+      # Keep the pod slices in step with the app; avoids a simulator-arch
+      # mismatch on Apple silicon Macs.
+      config.build_settings['ONLY_ACTIVE_ARCH'] = 'YES' if config.name == 'Debug'
+    end
+  end
+end
