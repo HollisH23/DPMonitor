@@ -1,227 +1,306 @@
-# Rehab Monitor — Phase 2.1 (B2C Patient Self-Service)
+# DPMonitor
 
-A privacy-centric rehabilitation monitoring system for **home use**. Each
-patient signs into their own account, picks one of their prescribed
-exercises, performs it in front of a webcam, and gets live AI-driven
-feedback on form. All processing — pose detection, scoring, persistence
-— happens on the patient's machine.
+**AI-powered physiotherapy coaching that runs entirely on your own device.**
 
-The clinician-facing patient list / patient management surface from
-Phase 1 has been deprecated; sessions are now owned directly by an
-authenticated user and all data is strictly per-user-scoped.
+DPMonitor watches a patient perform a rehabilitation exercise through an
+ordinary camera, counts their repetitions, measures how far each joint moves,
+and tells them when their form is drifting — in real time, with no video ever
+leaving the device.
 
-## Architecture
+There are two applications in this repository, built on the same analysis
+pipeline:
+
+| | Platform | Where processing happens |
+|---|---|---|
+| **iOS app** | iPhone (iOS 18+) | 100% on-device. No network code at all. |
+| **Web app** | Browser + local server | On the user's own machine. No cloud service. |
+
+---
+
+## Why this exists
+
+Physiotherapy works when patients do their exercises correctly at home,
+between appointments. In practice most of that happens unsupervised, so:
+
+- Patients don't know whether they're compensating with the wrong muscles.
+- Clinicians get no objective record of what actually happened at home —
+  only "I think I did about ten."
+- Commercial motion-tracking apps typically stream video to a server, which
+  is a hard sell for medical use and a privacy risk for the patient.
+
+DPMonitor addresses all three. It gives live corrective feedback, produces an
+objective session record (reps, range of motion, movement stability, fatigue),
+and does it without a single byte of video leaving the device.
+
+---
+
+## What it measures
+
+For every session the app produces:
+
+- **Repetition count** — from the vertical travel of the hips, using a
+  hysteresis detector that ignores postural sway.
+- **Range of motion (ROM)** — per-joint minimum, maximum and total swing in
+  degrees, for both knees, both hips and both elbows.
+- **Movement stability** — how smooth the motion was, from the RMS of joint
+  velocity and acceleration. Shaky movement scores lower.
+- **Fatigue index** — whether the later repetitions in a set were measurably
+  shakier than the earlier ones.
+- **Form quality** — a learned score from a graph neural network (see the
+  status note below).
+- **Framing assistance** — before recording starts, the app checks the patient
+  is properly positioned and tells them how to fix it.
+
+---
+
+> ### ⚠️ Project status: research prototype
+>
+> **The form-quality score is not active in this build.** The repository ships
+> no trained model checkpoint, so the network is built from deterministic
+> seeded weights. Its output is reproducible but not clinically meaningful, and
+> the app detects this and shows the form score as `—` rather than displaying a
+> confident, meaningless number.
+>
+> **Everything geometric works fully**: repetition counting, range of motion,
+> stability, fatigue and the centering assistant are all measured directly from
+> the skeleton and never touch the model.
+>
+> To enable form scoring, supply a trained checkpoint:
+> `python scripts/export_coreml.py --weights path/to/checkpoint.pt`.
+> No code changes are needed.
+>
+> This is a university research project and is **not a medical device**. It
+> must not be used to diagnose, treat or make clinical decisions.
+
+---
+
+## How it works
+
+A camera frame goes in; a set of measurements comes out.
 
 ```
-┌──────────────────── Browser (React + Vite) ────────────────────┐
-│   /login  →  Token (DRF authtoken) stored in localStorage      │
-│   /dashboard                                                   │
-│     ├── Exercise Guides & Prompts Module                       │
-│     │     • interactive cards with tutorials (text + cues)     │
-│     │     • click → /monitor?exercise=<key>                    │
-│     └── Last-7 Trend Chart (user-scoped GET /api/trend/)       │
-│   /monitor                                                     │
-│     ├── usePoseDetection (MediaPipe Pose, facingMode:user)     │
-│     ├── Mirror effect (CSS scaleX(-1))                         │
-│     ├── 30 FPS  → WebSocket  (token in query string)           │
-│     └── 15 FPS  → in-memory buffer → POST /api/sessions/ingest │
-└────────────────────────────────────────────────────────────────┘
-                              │  Token <key>
-                              ▼
-┌──────────── Django + Channels (rehab_backend) ─────────────────┐
-│   REST (DEFAULT_PERMISSION_CLASSES = IsAuthenticated)          │
-│     POST /api/auth/{register,login,logout}/  GET /me/          │
-│     GET  /api/sessions/                   (only request.user)  │
-│     GET  /api/sessions/<id>/              (404 if not yours)   │
-│     DELETE /api/sessions/<id>/                                 │
-│     POST /api/sessions/ingest/        (user from request.user) │
-│     GET  /api/trend/                  (last-7 for caller)      │
-│   WebSocket /ws/monitor/?token=<key>                           │
-│     • TokenAuthMiddleware → scope['user']                      │
-│     • Anonymous → close 4401                                   │
-│   Analyzer (deterministic, plug-and-play)                      │
-│     • BaseAnalyzer + PlaceholderAnalyzer                       │
-│     • Seed-based reproducibility                               │
-└────────────────────────────────────────────────────────────────┘
-                              │
-                       SQLite (backend/data/rehab_local.sqlite3)
+   Camera frame (30 per second)
+              │
+              ▼
+   ┌──────────────────────┐
+   │  MediaPipe Pose      │  Finds 33 body landmarks
+   │  (BlazePose Full)    │  (nose, shoulders, hips, knees, ankles …)
+   └──────────┬───────────┘
+              │
+    ┌─────────┴──────────┐
+    │                    │
+    ▼                    ▼
+ SCREEN space        WORLD space
+ (x, y in 0–1)       (x, y, z in metres)
+    │                    │
+    │                    ├─► Smoothing      Removes camera jitter
+    │                    ├─► Normalisation  Cancels out where the patient
+    │                    │                  stands and how far away they are
+    │                    ├─► Occlusion fix  Holds a joint's last good position
+    │                    │                  when it's briefly hidden
+    │                    ▼
+    │            ┌───────────────────┐
+    │            │  64-frame window  │  ~2 seconds of movement
+    │            └─────────┬─────────┘
+    │                      ▼
+    │            ┌───────────────────┐
+    │            │  CTR-GCN model    │  Graph neural network over the
+    │            │  (Core ML / ANE)  │  skeleton → form quality
+    │            └───────────────────┘
+    │
+    ├─► Rep counting      Hip travel over time
+    ├─► Joint angles      ROM, tremor, fatigue
+    └─► Centering check   "Step back", "Move right", "Head cut off"
 ```
 
-## Directory layout
+**Why two coordinate spaces?** Screen coordinates tell you *where in the frame*
+the patient is, which is what the rep counter and the framing assistant need.
+World coordinates are measured in metres and centred on the hips, which is what
+the neural network was configured for. Using the wrong one for either job
+produces plausible-looking numbers that are quietly wrong.
+
+**The model.** CTR-GCN (Channel-wise Topology Refinement Graph Convolutional
+Network) treats the skeleton as a graph — joints are nodes, bones are edges —
+and learns how that graph deforms over time. It's a standard architecture for
+skeleton-based action recognition. This project uses a custom 33-node graph
+matching MediaPipe's landmark layout, rather than the 25-node NTU-RGB+D layout
+the original paper used.
+
+---
+
+## Repository layout
 
 ```
 DPMonitor/
-├── implementation_plan.md
-├── README.md
-├── backend/
-│   ├── manage.py
-│   ├── requirements.txt
-│   ├── rehab_backend/          ← Django project (settings, urls, asgi, wsgi)
-│   ├── api/
-│   │   ├── auth_views.py       ← register / login / logout / me
-│   │   ├── views.py            ← session list/detail/ingest, trend, health
-│   │   ├── serializers.py      ← no patient FK; user resolved server-side
-│   │   ├── consumers.py        ← rejects anonymous WS with close 4401
-│   │   ├── ws_auth.py          ← token query-string middleware for Channels
-│   │   ├── routing.py
-│   │   └── tests.py            ← 23 tests
-│   ├── clinical_sessions/
-│   │   ├── models.py           ← Session.user FK on AUTH_USER_MODEL
-│   │   └── management/commands/seed_demo.py
-│   └── analyzer/
-└── frontend/
-    ├── package.json
-    ├── vite.config.js
-    └── src/
-        ├── App.jsx              ← AuthProvider + RequireAuth + Outlet shell
-        ├── auth/                ← AuthContext + RequireAuth guard
-        ├── api/                 ← token-aware client + token-WS client
-        ├── pages/
-        │   ├── Login.jsx        ← sign-in / register tabs
-        │   ├── Dashboard.jsx    ← Exercise Cards + Last-7 Trend
-        │   ├── LiveMonitor.jsx  ← mirrored selfie + tutorial drawer
-        │   └── ReportView.jsx
-        ├── components/
-        │   ├── ExerciseCard.jsx ← clickable card + tutorial modal
-        │   ├── JointGauges.jsx, HUD.jsx, SkeletonOverlay.jsx,
-        │   │   FeedbackList.jsx, StabilityChart.jsx, ControlBar.jsx,
-        │   │   MultiLineChart.jsx
-        ├── hooks/               ← usePoseDetection, useSessionMachine
-        ├── lib/                 ← poseUtils, thresholds, exercises (catalogue)
-        └── styles/global.css
+├── ios/               iPhone app (Swift / SwiftUI)      — 27 source files
+│   ├── DPMonitor/
+│   │   ├── Core/      Pose capture, maths, Core ML inference
+│   │   ├── Views/     Camera, skeleton overlay, HUD, results, history
+│   │   └── Storage/   Local Core Data session history
+│   └── DPMonitorTests/  Parity tests against the Python reference
+│
+├── backend/           Django server for the web app        — 69 tests
+│   ├── api/           REST + WebSocket endpoints
+│   ├── analyzer/      The analysis pipeline (Python reference implementation)
+│   └── clinical_sessions/  Session storage
+│
+├── frontend/          Web app (React + Vite)
+│
+├── ctrgcn/            The CTR-GCN model definition
+│
+└── scripts/
+    ├── export_coreml.py           PyTorch → ONNX → Core ML conversion
+    └── gen_reference_fixtures.py  Generates test fixtures for the iOS app
 ```
 
-## Running locally
+`backend/analyzer/` is the **reference implementation**. The iOS app
+re-implements the same maths in Swift, and the test suite pins the two together
+so they can't drift apart.
 
-### Backend
+---
+
+## Getting started
+
+### Web app
+
+You need Python 3.10+ and Node 18+.
 
 ```bash
+# 1. Backend
 cd backend
 python -m venv .venv
-source .venv/bin/activate           # Windows: .venv\Scripts\activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 python manage.py migrate
-python manage.py seed_demo          # optional — preload demo user
-python manage.py runserver 0.0.0.0:8000
+python manage.py seed_demo         # optional: creates a demo account
+python manage.py runserver
 ```
 
-After `seed_demo`, sign in as:
-
-| field    | value      |
-|----------|------------|
-| username | `demo`     |
-| password | `demopass` |
-
-### Frontend
-
 ```bash
+# 2. Frontend (in a second terminal)
 cd frontend
 npm install
-npm run dev      # http://localhost:5173
+npm run dev                        # opens http://localhost:5173
 ```
 
-To override the backend URL, copy `.env.example` to `.env.local` and edit
-`VITE_API_BASE` / `VITE_WS_BASE`.
+After `seed_demo` you can sign in as **`demo`** / **`demopass`**.
 
-## Verification
+### iOS app
 
-### Automated tests
+You need a Mac with Xcode 16+, and a **physical iPhone** — the simulator has no
+camera for the pose tracker to read.
 
 ```bash
-cd backend
-python manage.py test
+brew install xcodegen cocoapods
+
+# 1. Download the pose model (~9 MB)
+curl -L -o ios/DPMonitor/Models/pose_landmarker_full.task \
+  https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task
+
+# 2. Build the Core ML model from the PyTorch source
+python scripts/export_coreml.py
+
+# 3. Generate and open the Xcode project
+cd ios
+xcodegen generate
+pod install
+open DPMonitor.xcworkspace
 ```
 
-23 tests cover:
+Then set your development team in Xcode and run on your device.
 
-- **Auth** — register, login, login-fails-on-bad-creds, me-requires-auth,
-  logout-revokes-token (`AuthEndpointTests`)
-- **Session ingest** — auth required, FK is taken from `request.user`,
-  spoofed `user`/`patient` payload fields are ignored (`SessionIngestTests`)
-- **Strict data isolation** — User A can only list their own sessions,
-  detail/delete on User B's session 404s, anonymous list 401s
-  (`DataIsolationTests`)
-- **Last-7 trend** — aggregates only the caller's data (`TrendEndpointTests`)
-- **Public health** — reachable without auth (`HealthEndpointTests`)
-- **Deterministic analyzer** — same seed → byte-identical results, RNG
-  context isolation, summary ranges (`AnalyzerReproducibilityTests`)
-- **seed_demo** — creates demo user + sessions, idempotent with `--clear`
-  (`SeedDemoCommandTests`)
+> **Note:** the Xcode project is generated from `ios/project.yml` and is not
+> checked into git. Re-run `xcodegen generate && pod install` whenever files are
+> added or removed, or Xcode won't see them.
 
-### WebSocket auth (smoke-tested separately)
+Full iOS documentation — architecture, threading model, parity testing and the
+NPU profiling procedure — is in **[`ios/README.md`](ios/README.md)**.
 
-- No token → connection rejected with close code `4401`
-- Invalid token → close `4401`
-- Valid token → `ready` + `summary` round-trip works
+---
 
-### Manual end-to-end paths
-
-#### Quick path (no webcam)
+## Testing
 
 ```bash
-cd backend && python manage.py seed_demo --sessions 3
+cd backend && python manage.py test        # 69 tests
 ```
 
-Log in as `demo / demopass`. The dashboard shows the prescribed exercise
-cards plus the demo user's 3 squat sessions. Click any session to see a
-fully-rendered Clinical Report.
+```bash
+cd ios && xcodebuild test -workspace DPMonitor.xcworkspace -scheme DPMonitor \
+  -destination 'platform=iOS Simulator,name=iPhone 16 Pro Max'
+```
 
-#### Full path (with webcam)
+The interesting part of the test strategy is **cross-language parity**. Six
+numeric components exist in both Python and Swift, and a divergence between
+them wouldn't crash anything — it would silently produce different clinical
+numbers on different platforms. So `scripts/gen_reference_fixtures.py` runs the
+Python implementations over hundreds of inputs and writes the results to JSON;
+the Swift tests load that file and assert agreement to within `1e-4`.
 
-1. Visit `/`, get redirected to `/login`. Create an account (or sign in).
-2. On the Dashboard, click an exercise card — open the **Tutorial** modal
-   to read the cues, then **Start session**.
-3. Stand back so your full body is in frame (the chip flips
-   `CALIBRATING` → click **Begin Recording** to go `ACTIVE`).
-4. Perform reps. Verify the HUD count increments, the skeleton turns
-   amber/red on bad form, the feedback feed scrolls, and the stability
-   chart updates.
-5. Click **Finish & Generate Report**. The full trajectory uploads via
-   `POST /api/sessions/ingest/` and you're redirected to the report view.
-6. Open the Django admin (`/admin/`, after `createsuperuser`) and confirm
-   the `Session` row is linked to YOUR user — not a clinic-issued patient
-   row.
+The framing assistant is verified the same way against its original desktop
+implementation, matching exactly across 30,000 randomised inputs.
 
-## REST surface
+---
 
-| Auth | Method | Path | Purpose |
-|---|---|---|---|
-| – | GET | `/api/health/` | Liveness + analyzer metadata |
-| – | POST | `/api/auth/register/` | Create account; returns `{token, user}` |
-| – | POST | `/api/auth/login/` | Returns `{token, user}` |
-| ✓ | POST | `/api/auth/logout/` | Revokes the caller's token |
-| ✓ | GET  | `/api/auth/me/` | Whoami |
-| ✓ | GET  | `/api/sessions/` | List the **caller's** sessions |
-| ✓ | GET  | `/api/sessions/<id>/` | Caller's session + trajectory (404 if not theirs) |
-| ✓ | DELETE | `/api/sessions/<id>/` | Delete caller's session (cascades) |
-| ✓ | POST | `/api/sessions/ingest/` | Batch upload; user from token |
-| ✓ | GET  | `/api/trend/` | Last-7 aggregate for caller |
+## Privacy
 
-## Data contracts
+This is the design constraint the whole project is built around.
 
-| Direction | Channel | Shape |
-|---|---|---|
-| Browser → Backend | `WS /ws/monitor/?token=<key>` | `{type:"frame", frame_index, timestamp_ms, points:{landmark:[x,y,z,v]}, angles:{joint:deg}}` |
-| Backend → Browser | `WS /ws/monitor/` | `{type:"result", frame_index, count, quality_score, is_compensatory, feedback:[…], diagnostics}` |
-| Browser → Backend | `POST /api/sessions/ingest/` | Summary + `frames:[…]` at 15 FPS — **no patient field** |
-| Backend → Browser | `GET /api/sessions/<id>/` | Session detail + nested `trajectory.frames` |
+- **No video is ever recorded, saved, or transmitted.** Camera frames are
+  processed in memory and discarded.
+- **The iOS app has no networking code.** Not "network access disabled" — the
+  target links no networking framework and makes no requests. You can verify
+  this by running it in Airplane Mode; every feature works.
+- **The web app talks only to a server you run yourself**, on your own machine.
+  There is no hosted service.
+- **Session history is stored locally** — Core Data on iOS (encrypted at rest),
+  SQLite on the desktop. No cloud sync, no analytics, no telemetry.
+- The app requests **camera access only**. No photo library, microphone, or
+  location.
 
-## Privacy & determinism
+---
 
-- Database at `backend/data/rehab_local.sqlite3`. No external services.
-- Random Seed flows through `analyzer/seed.py::apply_global_seed` and is
-  surfaced in the UI status bar + every report so a reviewer can
-  reproduce a result trivially.
-- Strict data isolation: queryset-level `filter(user=request.user)` plus
-  Token-authenticated WebSockets mean foreign data is unreachable from
-  the API surface — not even as a 403.
+## Known limitations
 
-## Phase 2.1 deprecations
+- **Form scoring is inactive** without a trained checkpoint — see the status
+  note above.
+- **One person at a time.** The pipeline assumes a single patient in frame.
+- **Range-of-motion figures differ slightly between the iOS and web apps.** iOS
+  measures angles from true 3D world coordinates; the web app uses screen
+  coordinates, whose depth channel is on an arbitrary scale. The iOS numbers
+  are the more accurate ones. Compare rep counts across platforms, not absolute
+  ROM degrees.
+- **iOS 18+ and a recent iPhone.** Developed and profiled on iPhone 16 Pro Max.
+- **The rep counter is tuned for vertical movements** such as squats and
+  lunges, since it tracks hip height. Exercises without vertical hip travel
+  need a different heuristic.
 
-| Removed | Replaced by |
-|---|---|
-| `patients` Django app + `PatientProfile` model | `auth.User` (via `AUTH_USER_MODEL`) |
-| `GET/POST /api/patients/...` endpoints | `POST /api/auth/{register,login}/` |
-| `patient` field in ingest payload | Token → `request.user` server-side |
-| New Patient page, Patient Detail page | Login page + per-user Dashboard |
-| Patient list on Dashboard / sidebar | Exercise Guides & Prompts module |
+---
+
+## Licence
+
+Released under the **[MIT Licence](LICENSE)** — you are free to use, modify and
+distribute this code, including commercially, provided the copyright notice and
+licence text are retained. The software is provided as-is, without warranty.
+
+> **Note:** this is a university research project, and confirmation that the
+> code may be released under MIT is still pending with the institution. If that
+> turns out otherwise the licence may change; the position will be updated here.
+
+Third-party components carry their own licences — see
+[Acknowledgements](#acknowledgements). Note in particular that the CTR-GCN
+reference implementation this project builds on is separately licensed.
+
+---
+
+## Acknowledgements
+
+Built as a research project at the **University of Sydney**, supervised by
+Prof. Jinman Kim.
+
+This work builds on:
+
+- **[CTR-GCN](https://github.com/Uason-Chen/CTR-GCN)** — Chen et al.,
+  *Channel-wise Topology Refinement Graph Convolution for Skeleton-Based Action
+  Recognition*, ICCV 2021.
+- **[MediaPipe Pose](https://developers.google.com/mediapipe/solutions/vision/pose_landmarker)**
+  (BlazePose) — Google's on-device pose landmark detection.
